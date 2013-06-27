@@ -694,11 +694,14 @@ void ixgbe_unmap_and_free_tx_resource(struct ixgbe_ring *ring,
 {
 	if (tx_buffer->skb) {
 		dev_kfree_skb_any(tx_buffer->skb);
-		if (dma_unmap_len(tx_buffer, len))
-			dma_unmap_single(ring->dev,
-					 dma_unmap_addr(tx_buffer, dma),
-					 dma_unmap_len(tx_buffer, len),
-					 DMA_TO_DEVICE);
+		if (!skb_shared(tx_buffer->skb)) {
+			dev_kfree_skb_any(tx_buffer->skb);
+			if (dma_unmap_len(tx_buffer, len))
+				dma_unmap_single(ring->dev,
+						 dma_unmap_addr(tx_buffer, dma),
+						 dma_unmap_len(tx_buffer, len),
+						 DMA_TO_DEVICE);
+		}
 	} else if (dma_unmap_len(tx_buffer, len)) {
 		dma_unmap_page(ring->dev,
 			       dma_unmap_addr(tx_buffer, dma),
@@ -897,14 +900,16 @@ static bool ixgbe_clean_tx_irq(struct ixgbe_q_vector *q_vector,
 		total_bytes += tx_buffer->bytecount;
 		total_packets += tx_buffer->gso_segs;
 
-		/* free the skb */
+		/* free the skb if we're the last user */
 		dev_kfree_skb_any(tx_buffer->skb);
-
-		/* unmap skb header data */
-		dma_unmap_single(tx_ring->dev,
-				 dma_unmap_addr(tx_buffer, dma),
-				 dma_unmap_len(tx_buffer, len),
-				 DMA_TO_DEVICE);
+		if (!skb_shared(tx_buffer->skb)) {
+			dev_kfree_skb_any(tx_buffer->skb);
+			/* unmap skb header data */
+			dma_unmap_single(tx_ring->dev,
+					 dma_unmap_addr(tx_buffer, dma),
+					 dma_unmap_len(tx_buffer, len),
+					 DMA_TO_DEVICE);
+		}
 
 		/* clear tx_buffer data */
 		tx_buffer->skb = NULL;
@@ -6192,15 +6197,14 @@ static void ixgbe_tx_olinfo_status(union ixgbe_adv_tx_desc *tx_desc,
 #define IXGBE_TXD_CMD (IXGBE_TXD_CMD_EOP | \
 		       IXGBE_TXD_CMD_RS)
 
-static void ixgbe_tx_map(struct ixgbe_ring *tx_ring,
+static dma_addr_t ixgbe_tx_map(struct ixgbe_ring *tx_ring,
 			 struct ixgbe_tx_buffer *first,
-			 const u8 hdr_len)
+			 const u8 hdr_len, dma_addr_t dma)
 {
 	struct sk_buff *skb = first->skb;
 	struct ixgbe_tx_buffer *tx_buffer;
 	union ixgbe_adv_tx_desc *tx_desc;
 	struct skb_frag_struct *frag;
-	dma_addr_t dma;
 	unsigned int data_len, size;
 	u32 tx_flags = first->tx_flags;
 	u32 cmd_type = ixgbe_tx_cmd_type(skb, tx_flags);
@@ -6224,7 +6228,9 @@ static void ixgbe_tx_map(struct ixgbe_ring *tx_ring,
 	}
 
 #endif
-	dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
+	skb_get(skb);
+	if (!dma)
+		dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
 
 	tx_buffer = first;
 
@@ -6313,8 +6319,9 @@ static void ixgbe_tx_map(struct ixgbe_ring *tx_ring,
 	/* notify HW of packet */
 	writel(i, tx_ring->tail);
 
-	return;
+	return dma;
 dma_error:
+	dev_kfree_skb(skb);
 	dev_err(tx_ring->dev, "TX DMA map failed\n");
 
 	/* clear dma mappings for failed tx_buffer_info map */
@@ -6329,6 +6336,7 @@ dma_error:
 	}
 
 	tx_ring->next_to_use = i;
+	return 0;
 }
 
 static void ixgbe_atr(struct ixgbe_ring *ring,
@@ -6483,12 +6491,14 @@ netdev_tx_t ixgbe_xmit_frame_ring(struct sk_buff *skb,
 			  struct ixgbe_adapter *adapter,
 			  struct ixgbe_ring *tx_ring)
 {
-	struct ixgbe_tx_buffer *first;
+	struct ixgbe_tx_buffer *first = NULL;
 	int tso;
 	u32 tx_flags = 0;
 	unsigned short f;
 	u16 count = TXD_USE_COUNT(skb_headlen(skb));
 	__be16 protocol = skb->protocol;
+	dma_addr_t dma = 0;
+	int sent, to_send;
 	u8 hdr_len = 0;
 
 	/*
@@ -6501,16 +6511,21 @@ netdev_tx_t ixgbe_xmit_frame_ring(struct sk_buff *skb,
 	for (f = 0; f < skb_shinfo(skb)->nr_frags; f++)
 		count += TXD_USE_COUNT(skb_shinfo(skb)->frags[f].size);
 
-	if (ixgbe_maybe_stop_tx(tx_ring, count + 3)) {
-		tx_ring->tx_stats.tx_busy++;
-		return NETDEV_TX_BUSY;
-	}
+	/* total number of packets to be sent */
+	sent = 0;
+	to_send = 1;
+	if (skb->sk && skb->sk->sk_family == AF_PACKET && skb->sk->sk_mark)
+		to_send = skb->sk->sk_mark + 1;
 
-	/* record the location of the first descriptor for this packet */
-	first = &tx_ring->tx_buffer_info[tx_ring->next_to_use];
-	first->skb = skb;
-	first->bytecount = skb->len;
-	first->gso_segs = 1;
+#if 0
+	printk(KERN_DEBUG "%d(in): skb=%p sk=%p fa=%d mk=%d, to_send=%d sent=%d\n",
+	       __LINE__,
+	       skb,
+	       skb->sk,
+	       skb->sk ? skb->sk->sk_family : -1,
+	       skb->sk ? skb->sk->sk_mark : -1,
+	       to_send, sent);
+#endif
 
 	/* if we have a HW VLAN tag being added default to the HW one */
 	if (vlan_tx_tag_present(skb)) {
@@ -6570,6 +6585,21 @@ netdev_tx_t ixgbe_xmit_frame_ring(struct sk_buff *skb,
 		}
 	}
 
+
+do {
+	if (ixgbe_maybe_stop_tx(tx_ring, count + 3)) {
+		if (sent)
+			return NETDEV_TX_OK;
+		tx_ring->tx_stats.tx_busy++;
+		return NETDEV_TX_BUSY;
+	}
+
+	/* record the location of the first descriptor for this packet */
+	first = &tx_ring->tx_buffer_info[tx_ring->next_to_use];
+	first->skb = skb;
+	first->bytecount = skb->len;
+	first->gso_segs = 1;
+
 	/* record initial flags and protocol */
 	first->tx_flags = tx_flags;
 	first->protocol = protocol;
@@ -6584,8 +6614,8 @@ netdev_tx_t ixgbe_xmit_frame_ring(struct sk_buff *skb,
 
 		goto xmit_fcoe;
 	}
-
 #endif /* IXGBE_FCOE */
+
 	tso = ixgbe_tso(tx_ring, first, &hdr_len);
 	if (tso < 0)
 		goto out_drop;
@@ -6599,15 +6629,42 @@ netdev_tx_t ixgbe_xmit_frame_ring(struct sk_buff *skb,
 #ifdef IXGBE_FCOE
 xmit_fcoe:
 #endif /* IXGBE_FCOE */
-	ixgbe_tx_map(tx_ring, first, hdr_len);
 
+	dma = ixgbe_tx_map(tx_ring, first, hdr_len, dma);
+	sent++;
+
+	if (sent && skb->sk && skb->sk->sk_mark)
+		skb->sk->sk_mark--;
+
+ } while (sent < to_send);
+#if 0
+	printk(KERN_DEBUG "%d(out): skb=%p sk=%p fa=%d mk=%d, to_send=%d sent=%d\n",
+	       __LINE__,
+	       skb,
+	       skb->sk,
+	       skb->sk ? skb->sk->sk_family : -1,
+	       skb->sk ? skb->sk->sk_mark : -1,
+	       to_send, sent);
+#endif
 	ixgbe_maybe_stop_tx(tx_ring, DESC_NEEDED);
 
 	return NETDEV_TX_OK;
 
 out_drop:
-	dev_kfree_skb_any(first->skb);
-	first->skb = NULL;
+#if 0
+	printk(KERN_DEBUG "%d(drop): skb=%p sk=%p fa=%d mk=%d, to_send=%d sent=%d\n",
+	       __LINE__,
+	       skb,
+	       skb->sk,
+	       skb->sk ? skb->sk->sk_family : -1,
+	       skb->sk ? skb->sk->sk_mark : -1,
+	       to_send, sent);
+#endif
+	if (first) {
+		if (!sent)
+			dev_kfree_skb_any(first->skb);
+		first->skb = NULL;
+	}
 
 	return NETDEV_TX_OK;
 }
