@@ -1229,6 +1229,13 @@ static void mvneta_txq_bufs_free(struct mvneta_port *pp,
 		if (!skb)
 			continue;
 
+		/* we always keep +1 ref count on the skb, so we can free then
+		 * check.
+		 */
+		dev_kfree_skb_any(skb);
+		if (skb_shared(skb))
+			continue;
+
 		dma_unmap_single(pp->dev->dev.parent, tx_desc->buf_phys_addr,
 				 tx_desc->data_size, DMA_TO_DEVICE);
 		dev_kfree_skb_any(skb);
@@ -1482,8 +1489,9 @@ static int mvneta_tx(struct sk_buff *skb, struct net_device *dev)
 	struct mvneta_tx_queue *txq = &pp->txqs[txq_id];
 	struct mvneta_tx_desc *tx_desc;
 	struct netdev_queue *nq;
-	int frags = 0;
+	int frags = 0, sent = 0, len;
 	u32 tx_cmd;
+	u32 phys_addr;
 
 	if (!netif_running(dev))
 		goto out;
@@ -1491,58 +1499,79 @@ static int mvneta_tx(struct sk_buff *skb, struct net_device *dev)
 	frags = skb_shinfo(skb)->nr_frags + 1;
 	nq    = netdev_get_tx_queue(dev, txq_id);
 
-	/* Get a descriptor for the first part of the packet */
-	tx_desc = mvneta_txq_next_desc_get(txq);
+#if 0
+	printk(KERN_DEBUG "%s tx: q=%d fr=%d sk=%p fa=%d rto=%d sto=%d pri=%u mk=%u low=%d\n",
+	       dev_name(&dev->dev), txq_id, frags,
+	       skb->sk,
+	       skb->sk ? (int)skb->sk->sk_family : -1,
+	       skb->sk ? (int)skb->sk->sk_rcvtimeo : -1,
+	       skb->sk ? (int)skb->sk->sk_sndtimeo : -1,
+	       skb->sk ? (int)skb->sk->sk_priority : -1,
+	       skb->sk ? (int)skb->sk->sk_mark : -1,
+	       skb->sk ? (int)skb->sk->sk_rcvlowat : -1);
+#endif
 
 	tx_cmd = mvneta_skb_tx_csum(pp, skb);
+	tx_cmd |= (frags == 1) ? MVNETA_TXD_FLZ_DESC : MVNETA_TXD_F_DESC;
 
-	tx_desc->data_size = skb_headlen(skb);
+	len = skb_headlen(skb);
+	phys_addr = dma_map_single(dev->dev.parent, skb->data, len, DMA_TO_DEVICE);
 
-	tx_desc->buf_phys_addr = dma_map_single(dev->dev.parent, skb->data,
-						tx_desc->data_size,
-						DMA_TO_DEVICE);
-	if (unlikely(dma_mapping_error(dev->dev.parent,
-				       tx_desc->buf_phys_addr))) {
-		mvneta_txq_desc_put(txq);
+	if (unlikely(dma_mapping_error(dev->dev.parent, phys_addr))) {
 		frags = 0;
 		goto out;
 	}
 
-	if (frags == 1) {
-		/* First and Last descriptor */
-		tx_cmd |= MVNETA_TXD_FLZ_DESC;
-		tx_desc->command = tx_cmd;
-		txq->tx_skb[txq->txq_put_index] = skb;
-		mvneta_txq_inc_put(txq);
-	} else {
-		/* First but not Last */
-		tx_cmd |= MVNETA_TXD_F_DESC;
-		txq->tx_skb[txq->txq_put_index] = NULL;
-		mvneta_txq_inc_put(txq);
-		tx_desc->command = tx_cmd;
-		/* Continue with other skb fragments */
-		if (mvneta_tx_frag_process(pp, skb, txq)) {
-			dma_unmap_single(dev->dev.parent,
-					 tx_desc->buf_phys_addr,
-					 tx_desc->data_size,
-					 DMA_TO_DEVICE);
-			mvneta_txq_desc_put(txq);
-			frags = 0;
-			goto out;
-		}
-	}
+	while (1) {
+		/* Get a descriptor for the first part of the packet */
+		tx_desc = mvneta_txq_next_desc_get(txq);
+		tx_desc->data_size = len;
+		tx_desc->buf_phys_addr = phys_addr;
 
-	txq->count += frags;
-	mvneta_txq_pend_desc_add(pp, txq, frags);
+		if (frags == 1) {
+			/* First and Last descriptor */
+			tx_desc->command = tx_cmd;
+			txq->tx_skb[txq->txq_put_index] = skb;
+			mvneta_txq_inc_put(txq);
+		} else {
+			/* First but not Last */
+			txq->tx_skb[txq->txq_put_index] = NULL;
+			mvneta_txq_inc_put(txq);
+			tx_desc->command = tx_cmd;
+			/* Continue with other skb fragments */
+			if (mvneta_tx_frag_process(pp, skb, txq)) {
+				dma_unmap_single(dev->dev.parent,
+						 phys_addr, len,
+						 DMA_TO_DEVICE);
+				mvneta_txq_desc_put(txq);
+				frags = 0;
+				goto out;
+			}
+		}
+
+		skb_get(skb); /* keep one refcount per packet to be sent */
+
+		txq->count += frags;
+		sent += frags;
+		mvneta_txq_pend_desc_add(pp, txq, frags);
+
+		if (!skb->sk || skb->sk->sk_family != AF_PACKET || !skb->sk->sk_mark)
+			break;
+
+		if (txq->size - txq->count < MAX_SKB_FRAGS + 1)
+			break;
+
+		skb->sk->sk_mark--;
+	}
 
 	if (txq->size - txq->count < MAX_SKB_FRAGS + 1)
 		netif_tx_stop_queue(nq);
 
 out:
-	if (frags > 0) {
+	if (sent > 0) {
 		u64_stats_update_begin(&pp->tx_stats.syncp);
-		pp->tx_stats.packets++;
-		pp->tx_stats.bytes += skb->len;
+		pp->tx_stats.packets += sent;
+		pp->tx_stats.bytes += sent * skb->len;
 		u64_stats_update_end(&pp->tx_stats.syncp);
 
 	} else {
@@ -1556,7 +1585,7 @@ out:
 	/* If after calling mvneta_txq_done, count equals
 	 * frags, we need to set the timer
 	 */
-	if (txq->count == frags && frags > 0)
+	if (sent > 0 && txq->count == sent)
 		mvneta_add_tx_done_timer(pp);
 
 	return NETDEV_TX_OK;
