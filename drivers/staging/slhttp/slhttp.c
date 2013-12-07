@@ -92,15 +92,18 @@ static netdev_tx_t slhttp_xmit(struct sk_buff *skb, struct net_device *dev)
 	 */
 	skb_dst_force(skb);
 
-	if (likely(netif_rx(skb) == NET_RX_SUCCESS)) {
-		u64_stats_update_begin(&dstats->syncp);
-		dstats->tx_packets++;
-		dstats->tx_bytes += skb->len;
-		dstats->rx_packets++;
-		dstats->rx_bytes += skb->len;
-		u64_stats_update_end(&dstats->syncp);
-	}
+	local_bh_disable();
+	netif_receive_skb(skb);
+	local_bh_enable();
+
+	u64_stats_update_begin(&dstats->syncp);
+	dstats->tx_packets++;
+	dstats->tx_bytes += skb->len;
+	dstats->rx_packets++;
+	dstats->rx_bytes += skb->len;
+	u64_stats_update_end(&dstats->syncp);
 	return NETDEV_TX_OK;
+
  drop:
 	u64_stats_update_begin(&dstats->syncp);
 	dstats->tx_dropped++;
