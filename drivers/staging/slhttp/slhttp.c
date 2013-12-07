@@ -20,6 +20,9 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 
+#define LEN_ETH 14
+#define LEN_IP  20
+
 struct pcpu_dstats {
 	u64			tx_packets;
 	u64			tx_bytes;
@@ -73,23 +76,172 @@ static struct rtnl_link_stats64 *slhttp_get_stats64(struct net_device *dev,
 	return stats;
 }
 
+/* insert the ethernet header by copying the MAC addresses and protocol from an
+ * incoming skb. The addresses are not reversed because we're working with a
+ * no-arp device.
+ */
+static void insert_eth(struct sk_buff *out, struct sk_buff *in)
+{
+	/* prepend 14 bytes */
+	skb_push(out, LEN_ETH);
+	memcpy(out->data, in->data, LEN_ETH);
+}
+
+/* Insert an IP header in front of an existing SKB. It is assumed that there is enough
+ * room. The IP header checksum is computed.
+ */
+static void insert_ip(struct sk_buff *out, u16 id, u32 saddr, u32 daddr)
+{
+	/* prepend 20 bytes */
+	skb_push(out, LEN_IP);
+
+	/* build IP header */
+	*(u16 *)(out->data +  0)  = htons(0x4510);     /* IP, tos 10 */
+	*(u16 *)(out->data +  2)  = htons(out->len);   /* IP+TCP real len */
+	*(u16 *)(out->data +  4)  = id;                /* same ID as sender */
+	*(u16 *)(out->data +  6)  = htons(0x4000);     /* DF, ofs=0 */
+	*(u32 *)(out->data +  8)  = htonl(0x40060000); /* TTL=64, TCP, check=0 */
+	*(u32 *)(out->data + 12)  = saddr;
+	*(u32 *)(out->data + 16)  = daddr;
+
+	/* compute IP checksum. See also ip_send_check(). */
+	*(u16 *)(out->data + 10)  = ip_fast_csum(out->data, 5);
+}
+
+/* updates the TCP checksum after the packet is ready to go. It is assumed that
+ * the IP header is already OK and at the correct place, and that the partial
+ * TCP checksum has already been put into skb->csum. The ip_summed flag on the
+ * skb is updated.
+ */
+static void update_tcp_csum(struct sk_buff *out)
+{
+	*(u16 *)(out->data + LEN_ETH + LEN_IP + 16) =
+		tcp_v4_check(out->len - LEN_IP - LEN_ETH,
+			     *(u32 *)(out->data + LEN_ETH + 12), /* saddr */
+			     *(u32 *)(out->data + LEN_ETH + 16), /* daddr */
+			     out->csum);
+	out->ip_summed = CHECKSUM_UNNECESSARY;
+	out->csum = 0;
+}
+
+/* allocate an SKB for an FIN with enough room for prepending ETH + IP in
+ * front. The partial checksum is put into ->csum.
+ */
+static struct sk_buff *build_rst(struct net_device *dev, u16 spt, u16 dpt, u32 seq)
+{
+	struct sk_buff *out;
+
+	out = netdev_alloc_skb_ip_align(dev, LEN_ETH + LEN_IP + 20);
+	if (!out)
+		return out;
+
+	skb_reserve(out, LEN_ETH + LEN_IP);
+
+	/* build TCP header */
+	*(u16 *)(out->data +  0)  = spt;
+	*(u16 *)(out->data +  2)  = dpt;
+	*(u32 *)(out->data +  4)  = seq;
+	*(u32 *)(out->data +  8)  = 0;
+	*(u32 *)(out->data + 12)  = htonl(0x500405b4); /* doff=20, rst, win=1460 */
+	*(u32 *)(out->data + 16)  = 0;                 /* check, urgptr */
+	skb_put(out, 20);
+
+	/* compute partial TCP checksum */
+	out->csum  = csum_partial(out->data, 20, 0);
+	return out;
+}
+
+/* allocate an SKB for a FIN with enough room for prepending ETH + IP in
+ * front. The partial checksum is put into ->csum.
+ */
+static struct sk_buff *build_fin(struct net_device *dev, u16 spt, u16 dpt, u32 seq, u32 ack)
+{
+	struct sk_buff *out;
+
+	out = netdev_alloc_skb_ip_align(dev, LEN_ETH + LEN_IP + 20);
+	if (!out)
+		return out;
+
+	skb_reserve(out, LEN_ETH + LEN_IP);
+
+	/* build TCP header */
+	*(u16 *)(out->data +  0)  = spt;
+	*(u16 *)(out->data +  2)  = dpt;
+	*(u32 *)(out->data +  4)  = seq;
+	*(u32 *)(out->data +  8)  = ack;
+	*(u32 *)(out->data + 12)  = htonl(0x501105b4); /* doff=20, fin+ack, win=1460 */
+	*(u32 *)(out->data + 16)  = 0;                 /* check, urgptr */
+	skb_put(out, 20);
+
+	/* compute partial TCP checksum */
+	out->csum  = csum_partial(out->data, 20, 0);
+	return out;
+}
+
+/* allocate an SKB for a SYN/ACK with enough room for prepending ETH + IP in
+ * front. The partial checksum is put into ->csum.
+ */
+static struct sk_buff *build_syn_ack(struct net_device *dev, u16 spt, u16 dpt, u32 seq, u32 ack)
+{
+	struct sk_buff *out;
+
+	out = netdev_alloc_skb_ip_align(dev, LEN_ETH + LEN_IP + 24);
+	if (!out)
+		return out;
+
+	skb_reserve(out, LEN_ETH + LEN_IP);
+
+	/* build TCP header */
+	*(u16 *)(out->data +  0)  = spt;
+	*(u16 *)(out->data +  2)  = dpt;
+	*(u32 *)(out->data +  4)  = seq;
+	*(u32 *)(out->data +  8)  = ack;
+	*(u32 *)(out->data + 12)  = htonl(0x601205b4); /* doff=24, synack, win=1460 */
+	*(u32 *)(out->data + 16)  = 0;                 /* check, urgptr */
+	*(u32 *)(out->data + 20)  = htonl(0x020405b4); /* opt: MSS=<1460> */
+	skb_put(out, 24);
+
+	/* compute partial TCP checksum */
+	out->csum  = csum_partial(out->data, 24, 0);
+	return out;
+}
+
+/* allocate an SKB for a data ACK with enough room for prepending ETH + IP in
+ * front. The partial checksum is put into ->csum.
+ */
+static struct sk_buff *build_data_ack(struct net_device *dev, u16 spt, u16 dpt, u32 seq, u32 ack, u8 flags, u16 data)
+{
+	struct sk_buff *out;
+
+	out = netdev_alloc_skb_ip_align(dev, LEN_ETH + LEN_IP + 20 + data);
+	if (!out)
+		return out;
+
+	skb_reserve(out, LEN_ETH + LEN_IP);
+
+	/* build TCP header */
+	*(u16 *)(out->data +  0)  = spt;
+	*(u16 *)(out->data +  2)  = dpt;
+	*(u32 *)(out->data +  4)  = seq;
+	*(u32 *)(out->data +  8)  = ack;
+	*(u32 *)(out->data + 12)  = htonl(0x501005b4); /* doff=20, ack, win=1460 */
+	*(u32 *)(out->data + 13)  |= flags;
+	*(u32 *)(out->data + 16)  = 0;                 /* check, urgptr */
+	skb_put(out, 20 + data);
+
+	/* compute partial TCP checksum */
+	out->csum  = csum_partial(out->data, out->len, 0);
+	return out;
+}
+
 static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int *op, int *ob)
 {
 	struct iphdr *ih;
 	struct tcphdr *th;
-	u32 ack, st, seq;
-	u32 dst, src;
-	u16 spt, dpt, id;
+	u32 ack, st;
 	u32 ihl;
 	u32 thlen;
 	struct sk_buff *pkt1, *pkt2;
-
-	//printk("@%d: skb->head=%p, data=%d, tail=%d, end=%d, len=%d\n", __LINE__,
-	//       skb->head,
-	//       (int)(skb->data - skb->head),
-	//       (int)(skb_tail_pointer(skb) - skb->head),
-	//       (int)(skb_end_pointer(skb) - skb->head),
-	//       (int)skb->len);
 
 	skb->protocol = eth_type_trans(skb, dev);
 	if (skb->protocol != htons(ETH_P_IP))
@@ -118,81 +270,23 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 	if (!pskb_may_pull(skb, thlen))
 		return;
 
-	if (th->syn) {
-		/* build a SYN-ACK inside the packet existing skb */
-		pkt1 = netdev_alloc_skb_ip_align(dev, 14 + 20 + 24);
+	/* note that all sources and destinations are swapped since we're
+	 * responding to a peer.
+	 */
+	if (th->syn && !th->ack) {
+		/* we got a SYN, we return a SYN-ACK with SEQ%16=0 for state REQ */
+		pkt1 = build_syn_ack(dev, th->dest, th->source,
+		                     htonl((isn << 4) + SLH_ST_REQ - 1),  /* -1 for the SYN */
+		                     htonl(ntohl(th->seq) + 1));
+		if (!pkt1)
+			return;
 
-		//pkt1 = netdev_alloc_skb(dev, 14 + 20 + 24);
-		//if (!pkt1)
-		//	return;
-		//skb_reserve(pkt1, 2);
+		insert_ip(pkt1, ih->id, ih->daddr, ih->saddr);
 
-		//printk("@%d: pkt1->head=%p, data=%d, tail=%d, end=%d, len=%d\n", __LINE__,
-		//       pkt1->head,
-		//       (int)(pkt1->data - pkt1->head),
-		//       (int)(skb_tail_pointer(pkt1) - pkt1->head),
-		//       (int)(skb_end_pointer(pkt1) - pkt1->head),
-		//       (int)pkt1->len);
+		insert_eth(pkt1, skb);
 
-
-		/* build ethernet : in theory we should swap src/dst and keep
-		 * the protocol, but in practice we're on a noarp device so
-		 * src=dst. Note: in noarp, there's no mac.
-		 */
-		memcpy(pkt1->data, skb->data, 14);
-		//printk("data=%04x:%04x:%04x | %04x:%04x:%04x | %04x | %02x %02x %02x %02x ...\n",
-		//       *(u16 *)(skb->data+0),
-		//       *(u16 *)(skb->data+2),
-		//       *(u16 *)(skb->data+4),
-		//       *(u16 *)(skb->data+6),
-		//       *(u16 *)(skb->data+8),
-		//       *(u16 *)(skb->data+10),
-		//       *(u16 *)(skb->data+12),
-		//       *(u8 *)(skb->data+14),
-		//       *(u8 *)(skb->data+15),
-		//       *(u8 *)(skb->data+16),
-		//       *(u8 *)(skb->data+17));
-
-		/* build IP header */
-		*(u32 *)(pkt1->data + 14)  = htonl(0x4510002C); /* IP, tos 10, len 44 */
-		*(u16 *)(pkt1->data + 18)  = ih->id;            /* same ID as sender */
-		*(u16 *)(pkt1->data + 20)  = htons(0x4000);     /* DF, ofs=0 */
-		*(u32 *)(pkt1->data + 22)  = htonl(0x40060000); /* TTL=64, TCP, check=0 */
-		*(u32 *)(pkt1->data + 26) = ih->daddr;
-		*(u32 *)(pkt1->data + 30) = ih->saddr;
-
-		/* compute IP checksum. See also ip_send_check(). */
-		*(u16 *)(pkt1->data + 24)  = ip_fast_csum(pkt1->data + 14, 5);
-
-		/* build TCP header */
-		*(u16 *)(pkt1->data + 34) = th->dest;
-		*(u16 *)(pkt1->data + 36) = th->source;
-		*(u32 *)(pkt1->data + 38) = htonl(isn << 4);
-		*(u32 *)(pkt1->data + 42) = htonl(ntohl(th->seq) + 1);
-		*(u32 *)(pkt1->data + 46) = htonl(0x601205b4); /* doff=24, synack, win=1460 */
-		*(u32 *)(pkt1->data + 50) = 0;                 /* check, urgptr */
-		*(u32 *)(pkt1->data + 54) = htonl(0x020405b4); /* opt: MSS=<1460> */
-
-		/* compute TCP checksum */
-		*(u16*)(&pkt1->data[50]) =
-			tcp_v4_check(24,
-			             *(u32 *)(pkt1->data + 26),
-			             *(u32 *)(pkt1->data + 30),
-			             csum_partial(pkt1->data + 34, 24, 0));
-
-		/* finish the skb */
-		skb_put(pkt1, 14 + 20 + 24);
-
-		//printk("@%d: pkt1->head=%p, data=%d, tail=%d, end=%d, len=%d\n", __LINE__,
-		//       pkt1->head,
-		//       (int)(pkt1->data - pkt1->head),
-		//       (int)(skb_tail_pointer(pkt1) - pkt1->head),
-		//       (int)(skb_end_pointer(pkt1) - pkt1->head),
-		//       (int)pkt1->len);
-
+		update_tcp_csum(pkt1);
 		pkt1->protocol = eth_type_trans(pkt1, dev);
-		pkt1->ip_summed = CHECKSUM_UNNECESSARY;
-		pkt1->csum = 0;
 
 		isn++;
 
@@ -201,13 +295,11 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 		local_bh_disable();
 		netif_receive_skb(pkt1);
 		local_bh_enable();
-
 		return;
 	}
 
 	ack = th->ack_seq;
 	st = ack & 15;
-
 	return;
 }
 
