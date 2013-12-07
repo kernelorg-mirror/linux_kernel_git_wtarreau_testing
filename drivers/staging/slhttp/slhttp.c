@@ -241,7 +241,7 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 	u32 ack, st;
 	u32 ihl;
 	u32 thlen;
-	struct sk_buff *pkt1, *pkt2;
+	struct sk_buff *pkt1;
 
 	skb->protocol = eth_type_trans(skb, dev);
 	if (skb->protocol != htons(ETH_P_IP))
@@ -270,6 +270,10 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 	if (!pskb_may_pull(skb, thlen))
 		return;
 
+	/* retrieve the next state requested by the peer */
+	ack = th->ack_seq;
+	st = ntohl(ack) & 15;
+
 	/* note that all sources and destinations are swapped since we're
 	 * responding to a peer.
 	 */
@@ -280,26 +284,27 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 		                     htonl(ntohl(th->seq) + 1));
 		if (!pkt1)
 			return;
-
-		insert_ip(pkt1, ih->id, ih->daddr, ih->saddr);
-
-		insert_eth(pkt1, skb);
-
-		update_tcp_csum(pkt1);
-		pkt1->protocol = eth_type_trans(pkt1, dev);
-
 		isn++;
-
-		//skb_dst_force(pkt1);
-		/* see dev_forward_skb() instead ? => no, does netif_rx() */
-		local_bh_disable();
-		netif_receive_skb(pkt1);
-		local_bh_enable();
+	}
+	else if (th->rst) {
+		/* never reply anything to an RST */
 		return;
 	}
+	else {
+		/* for now on, we reset everything */
+		pkt1 = build_rst(dev, th->dest, th->source, ack);
+		if (!pkt1)
+			return;
+	}
 
-	ack = th->ack_seq;
-	st = ack & 15;
+	insert_ip(pkt1, ih->id, ih->daddr, ih->saddr);
+	insert_eth(pkt1, skb);
+	update_tcp_csum(pkt1);
+	pkt1->protocol = eth_type_trans(pkt1, dev);
+
+	local_bh_disable();
+	netif_receive_skb(pkt1);
+	local_bh_enable();
 	return;
 }
 
