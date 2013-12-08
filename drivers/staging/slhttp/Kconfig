@@ -1,0 +1,11 @@
+config SLHTTP
+	tristate "Stateless HTTP Server"
+	depends on NETDEVICES
+	---help---
+	  This is a stress-testing tool which emulates an HTTP server, but
+	  without maitaining any internal state. It only relies on the ACKs
+	  sent by the client. It achieves higher speeds than user-space servers
+	  but lacks a number of controls. It presents itself as a network
+	  interface which responds to any TCP traffic sent to the networks
+	  behind it. If you don't understand what all this is about, say N.
+
