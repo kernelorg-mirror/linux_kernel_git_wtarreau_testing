@@ -146,7 +146,6 @@ static void update_tcp_csum(struct sk_buff *out)
 			     *(u32 *)(out->data + LEN_ETH + 16), /* daddr */
 			     out->csum);
 	out->ip_summed = CHECKSUM_UNNECESSARY;
-	out->csum = 0;
 }
 
 /* allocate an SKB for an FIN with enough room for prepending ETH + IP in
@@ -556,7 +555,10 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 			out += pkt1_size;
 		}
 
-		skb_put(pkt1, out - skb_tail_pointer(pkt1));
+		/* payload size */
+		pkt1_size = out - skb_tail_pointer(pkt1);
+		pkt1->csum = csum_partial(skb_tail_pointer(pkt1), pkt1_size, pkt1->csum);
+		skb_put(pkt1, pkt1_size);
 	}
 	else if ((st >= SLH_ST_ACK_CL_LAST_7 && st <= SLH_ST_ACK_CL_LAST_1) ||
 		 (st >= SLH_ST_ACK_KA_LAST_5 && st <= SLH_ST_ACK_KA_LAST_1)) {
@@ -588,7 +590,8 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 		//       skb_end_pointer(pkt1) - pkt1->head);
 
 		//memset(skb_tail_pointer(pkt1), 0, 1460);
-		//skb_put(pkt1, 16); /* 16 bytes and loop here */
+		pkt1->csum = csum_partial(skb_tail_pointer(pkt1), 1457, (pkt1->csum));
+		//skb_put(pkt1, 1456); /* 91*16 bytes and loop here */
 		skb_put(pkt1, 1457); /* 91*16 + 1 => one step forward */
 	}
 	else if (st == SLH_ST_LASTACK) {
