@@ -35,9 +35,22 @@ struct pcpu_dstats {
 enum {
 	SLH_ST_REQ = 0,
 	SLH_ST_LASTACK = 1,
+
 	SLH_ST_ACK_CL_LAST = 2,
-	SLH_ST_ACK_CL_FIN = 3,
-	/* other states are not as much important */
+	SLH_ST_ACK_CL_FIN = 3, /* must absolutely equal SLH_ST_ACK_CL_LAST + 1 */
+
+	/* the last states must be the ones for the keep-alive mode, because we
+	 * want them to count +1 modulo 16 and automatically loop to 0.
+	 */
+};
+
+/* flags used to build our return packets */
+enum {
+	FLG_FIN = 1,
+	FLG_SYN = 2,
+	FLG_RST = 4,
+	FLG_PSH = 8,
+	FLG_ACK = 16,
 };
 
 /* This one has to be increased by 16 for each SYN emitted. It does not
@@ -303,6 +316,20 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 		goto send_rst;
 	}
 	else if (st == SLH_ST_REQ) {
+		int ka   = 0;  /* 0 = close, 1 = keep-alive */
+		int size = 0;  /* requested object size */
+		int ver  = 0;  /* 0 = HTTP/1.0, 1 = HTTP/1.1 */
+		int budget;    /* how much left in the first packet */
+		int sizelen;   /* bytes needed to encode <size> */
+		int hdrlen;    /* header len for the first packet */
+		int pkt1_size = 0;   /* data in the first packet */
+		int nb_data_pkt = 0; /* # of extra packets */
+		int final_state;
+		int pad = 0;   /* amount of padding to add */
+		int fin = 0;   /* send fin */
+		const char *parse;
+		unsigned char *out;
+
 		if (!datalen) {
 			if (th->fin) {
 				/* return a FIN and go to the LASTACK state on FIN */
@@ -315,49 +342,203 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 			 */
 			return;
 		}
-		if (*(u32 *)dataptr != ntohl(0x47455420)) // "GET "
+
+		if (datalen < 15 || /* "GET / HTTP/1.0\n", at least supports telnet */
+		    *(u32 *)dataptr != ntohl(0x47455420) || dataptr[4] != '/') // "GET /"
 			goto send_rst;
-		/* debug */
 
-		/* we offer a FIN if there was one, it allows us to increase the
-		 * SEQ by 1 and enter the next state.
-		 */
-		if (!th->fin)
-			pkt1 = build_data_ack(dev, th->dest, th->source,
-					      ack, htonl(ntohl(th->seq) + datalen),
-					      TCP_FLAG_PSH, 64);
+		/* parse the request */
+
+		/* first, "/k/something" requests keep-alive */
+		parse = dataptr + 5;
+		if (*parse == 'k') {
+			ka = !th->fin;  /* no keep-alive if FIN present */
+			parse += 1 + (parse[1] == '/');
+		}
+
+		/* get requested object size */
+		while (parse < dataptr + datalen && (unsigned char)(*parse - '0') <= 9) {
+			size = (size * 10) + (*parse - '0');
+			parse++;
+		}
+
+		if (size < 10)
+			sizelen = 1;
+		else if (size < 100)
+			sizelen = 2;
+		else if (size < 1000)
+			sizelen = 3;
+		else if (size < 10000)
+			sizelen = 4;
 		else
-			pkt1 = build_data_ack(dev, th->dest, th->source,
-					      ack, htonl(ntohl(th->seq) + datalen + 1),
-					      TCP_FLAG_PSH | TCP_FLAG_FIN, 64);
+			sizelen = 5;
 
-		memcpy(skb_tail_pointer(pkt1),
-		       "HTTP/1.0 200 OK\r\n"        //   17
-		       "Content-length: 2\r\n"      // + 19 = 36
-		       "Connection: keep-alive\r\n" // + 24 = 60
-		       "\r\n"                       // +  2 = 62
-		       ".\n"                        // +  2 = 64
-		       , 64);
+		/* check HTTP version */
+		while (parse < dataptr + datalen && *parse != ' ' && *parse != '\r' && *parse != '\n')
+			parse++;
 
-		//memcpy(skb_tail_pointer(pkt1),
-		//       "HTTP/1.1 200 OK\r\n"     //   17
-		//       "Content-length:  9\r\n"  // + 20 = 37
-		//       "\r\n"                    // +  2 = 39
-		//       "Hello !\r\n"             // +  9 = 48
-		//       , 48);
+		if (parse + 9 <= dataptr + datalen && memcmp(parse, " HTTP/1.", 8) == 0) {
+			ver = parse[8] == '1';
+			parse += 9;
+		}
 
+		/* Now let's see how we'll build the response. We have to send :
+		 *   "HTTP/1.x 200 OK\r\n"        => 17 chars
+		 *   "Connection: keep-alive\r\n" => 24 chars when in 1.0 with keep-alive
+		 *   "Content-length: x\r\n"      => 19 chars for 0..9, 20 for 10..99,
+		 *                                   21 for 100..999, 22 for 1000..9999,
+		 *                                   23 for 10000..99999, RST above
+		 *   "X-Pad:xxxxx\r\n"            => 8..23 (0..15 spaces) if padding is required
+		 *   "\r\n"                       => 2 chars
+		 *
+		 * Total:
+		 *   - 17+24+2+18+sizelen in 1.0 + keep-alive = 61+sizelen
+		 *   - 17+2+18+sizelen in 1.1 or 1.0+close    = 37+sizelen
+		 *   - plus up to 23 if padding is required =>
+		 *        61 + 5 + 23 = 89 in 1.0 + keep-alive
+		 *        37 + 5 + 23 = 65 otherwise
+		 *
+		 * We need to adjust the amount of output data so that the sum
+		 * of data emitted modulo 16 equals :
+		 *   - 16 - #extra_packets if responding in keep-alive as we
+		 *     want to get back to this state after #extra packets ;
+		 *   - 0 if doing keep-alive with a single packet (same as above)
+		 *   - 0 if we're on the last packet and FIN was present, because
+		 *     we're going to emit a FIN which counts as one and will go to
+		 *     LASTACK ;
+		 *   - CL_LAST if we're emitting the last packet + a FIN so that
+		 *     the sum equals ACK_CL_FIN
+		 *
+		 * The data in the first packet may not be larger than 1370 bytes
+		 * so that we still have up to 90 bytes to the headers.
+		 */
 
-		//memcpy(skb_tail_pointer(pkt1),
-		//       "HTTP/1.1 304 OK\r\n"     //   17
-		//       "x-pad: 8901\r\n"         // + 13 = 30
-		//       "\r\n"                    // +  2 = 32
-		//       , 32);
+		budget  = 1460;
+		hdrlen  = 0;
+		hdrlen += 17;           /* status line */
+		hdrlen += 2;            /* CRLF */
+		hdrlen += 18 + sizelen; /* content-length */
+		if (!ver && ka)         /* connection */
+			hdrlen += 24;
 
-		skb_put(pkt1, 64);
+		budget -= hdrlen + 23;  /* if X-Pad is needed */
+
+		pkt1_size = size;
+		if (pkt1_size > budget) {
+			/* need more than one packet. Each other packet will be
+			 * 1457 bytes (=1 modulo 16). The first one will carry
+			 * the complement.
+			 *
+			 * This means that there are a number of sizes we cannot
+			 * handle, they're all those which add more than budget to
+			 * multiples of 1457. We don't care much, we simply truncate
+			 * the size so that the first packet can be sent.
+			 */
+			nb_data_pkt = size / 1457;
+			pkt1_size = size - (nb_data_pkt * 1457);
+			if (pkt1_size > budget) {
+				pkt1_size = budget;
+				size = pkt1_size + nb_data_pkt * 1457;
+			}
+		}
+
+		/* We don't consider our FIN here. It equals one byte but since
+		 * our post-FIN states are exactly the previous one plus 1, we
+		 * must ignore it for now. However, we want to go to the LASTACK
+		 * state if the client has presented a FIN first, so this is
+		 * equivalent to going into ST_REQ without FIN.
+		 */
+		if (ka || th->fin)
+			final_state = SLH_ST_REQ;
+		else
+			final_state = SLH_ST_ACK_CL_LAST;
+
+		/* remember, each packet counts 1 step */
+		pad  = final_state - st - nb_data_pkt;
+		pad -= hdrlen + pkt1_size;
+		pad  = pad & 15;
+		/* pad is the size we need to add using the "X-Pad" header */
+
+		//printk("Preparing to send %d bytes, with a first pkt of %d hdr + %d pad + %d data (budget %d) and %d packets of 1457. ka=%d ver=%d finst=%d, sizelen=%d\n",
+		//       size, hdrlen, pad, pkt1_size, budget, nb_data_pkt, ka, ver, final_state, sizelen);
+
+		/* now it's getting tricky. We ack the peer's possible FIN only
+		 * if we're in the last packet so that it continues sending it.
+		 * We send a FIN if we're on the last packet and we have a FIN
+		 * in the request, or if the final state is ACK_CL_LAST because
+		 * we're sending the last packet of a close transfer.
+		 */
+		fin = !nb_data_pkt && (th->fin || final_state == SLH_ST_ACK_CL_LAST);
+
+		pkt1 = build_data_ack(dev, th->dest, th->source,
+				      ack,
+				      htonl(ntohl(th->seq) + datalen + (nb_data_pkt ? 0 : th->fin)),
+				      FLG_PSH + (fin ? FLG_FIN : 0),
+				      hdrlen + pkt1_size + 24 /* pad */);
+		if (!pkt1)
+			return;
+
+		out = skb_tail_pointer(pkt1);
+		out += snprintf(out, hdrlen,
+		                "HTTP/1.%d 200 OK\r\nContent-length: %d\r\n",
+		                ver, size);
+
+		if (!ver && ka) {
+			memcpy(out, "Connection: keep-alive\r\n", 24);
+			out += 24;
+		}
+
+		if (pad) {
+			/* we have 8 non-reductible bytes */
+			memcpy(out, "X-Pad: 0123456789abcde", 22);
+			out[((pad - 8) & 15) + 6] = '\r';
+			out[((pad - 8) & 15) + 7] = '\n';
+			out += ((pad - 8) & 15) + 8;
+		}
+
+		/* final CRLF */
+		*out++ = '\r';
+		*out++ = '\n';
+
+		/* fill with readable data for small packets, and skip one line for last char */
+		if (pkt1_size < 200) {
+			while (pkt1_size--) {
+				if (!pkt1_size)
+					*out++ = '\n';
+				else
+					*out++ = ".123456789ABCDEF"[pkt1_size & 15];
+			}
+		}
+		else {
+			out += pkt1_size;
+		}
+
+		skb_put(pkt1, out - skb_tail_pointer(pkt1));
 	}
 	else if (st == SLH_ST_LASTACK) {
 		/* silently drop everything in this state, we're draining ACKs */
 		return;
+	}
+	else if (st == SLH_ST_ACK_CL_LAST) {
+		/* our FIN was not ACKed, let's retransmit it, it will push us
+		 * automatically to state ACK_CL_FIN
+		 */
+		pkt1 = build_data_ack(dev, th->dest, th->source,
+				      ack, th->seq, FLG_FIN, 0);
+	}
+	else if (st == SLH_ST_ACK_CL_FIN) {
+		/* our FIN was ACKed. If the client sent its FIN, we must ACK it.
+		 * Otherwise it might be the remote stack which is ACKing our
+		 * last packet, in which case we have nothing more to say. The
+		 * client will happily close with its FIN later or with an RST.
+		 * We must not emit any FIN since it was already sent and ACKed.
+		 */
+		if (!th->fin)
+			return;
+
+		pkt1 = build_data_ack(dev, th->dest, th->source,
+				      ack, htonl(ntohl(th->seq) + th->fin),
+				      0, 0);
 	}
 	else {
 		/* for now on, we reset everything */
@@ -371,6 +552,9 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 	insert_eth(pkt1, skb);
 	update_tcp_csum(pkt1);
 	pkt1->protocol = eth_type_trans(pkt1, dev);
+
+	*op = 1;
+	*ob = pkt1->len;
 
 	local_bh_disable();
 	netif_receive_skb(pkt1);
