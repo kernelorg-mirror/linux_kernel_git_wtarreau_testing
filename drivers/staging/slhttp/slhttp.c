@@ -280,8 +280,9 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 	ack = th->ack_seq;
 	st = ntohl(ack) & 15;
 
-	//printk("syn=%d ack=%d fin=%d rst=%d st=%d\n",
-	//       th->syn, th->ack, th->fin, th->rst, st);
+	//printk("seq=%d ack_seq=%d syn=%d ack=%d fin=%d rst=%d st=%d\n",
+	//       ntohl(th->seq), ntohl(th->ack_seq), th->syn,
+	//       th->ack, th->fin, th->rst, st);
 
 	/* note that all sources and destinations are swapped since we're
 	 * responding to a peer.
@@ -324,14 +325,35 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 		if (!th->fin)
 			pkt1 = build_data_ack(dev, th->dest, th->source,
 					      ack, htonl(ntohl(th->seq) + datalen),
-					      TCP_FLAG_PSH, 16);
+					      TCP_FLAG_PSH, 64);
 		else
 			pkt1 = build_data_ack(dev, th->dest, th->source,
 					      ack, htonl(ntohl(th->seq) + datalen + 1),
-					      TCP_FLAG_PSH | TCP_FLAG_FIN, 16);
+					      TCP_FLAG_PSH | TCP_FLAG_FIN, 64);
 
-		memcpy(skb_tail_pointer(pkt1), "It Works Well!\r\n", 16);
-		skb_put(pkt1, 16);
+		memcpy(skb_tail_pointer(pkt1),
+		       "HTTP/1.0 200 OK\r\n"        //   17
+		       "Content-length: 2\r\n"      // + 19 = 36
+		       "Connection: keep-alive\r\n" // + 24 = 60
+		       "\r\n"                       // +  2 = 62
+		       ".\n"                        // +  2 = 64
+		       , 64);
+
+		//memcpy(skb_tail_pointer(pkt1),
+		//       "HTTP/1.1 200 OK\r\n"     //   17
+		//       "Content-length:  9\r\n"  // + 20 = 37
+		//       "\r\n"                    // +  2 = 39
+		//       "Hello !\r\n"             // +  9 = 48
+		//       , 48);
+
+
+		//memcpy(skb_tail_pointer(pkt1),
+		//       "HTTP/1.1 304 OK\r\n"     //   17
+		//       "x-pad: 8901\r\n"         // + 13 = 30
+		//       "\r\n"                    // +  2 = 32
+		//       , 32);
+
+		skb_put(pkt1, 64);
 	}
 	else if (st == SLH_ST_LASTACK) {
 		/* silently drop everything in this state, we're draining ACKs */
