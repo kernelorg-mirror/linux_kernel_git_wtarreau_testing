@@ -556,9 +556,13 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 	*op = 1;
 	*ob = pkt1->len;
 
-	local_bh_disable();
-	netif_receive_skb(pkt1);
-	local_bh_enable();
+	netif_rx(pkt1);
+	// This does not work when ab uses 2 packets in keep-alive mode with
+	// a single connection: ab -k -c 1 -n 2 http://1.0.0.2:8000/2000,
+	// the system hangs in netif_receive_skb().
+	//local_bh_disable();
+	//netif_receive_skb(pkt1);
+	//local_bh_enable();
 	return;
 
  send_rst:
