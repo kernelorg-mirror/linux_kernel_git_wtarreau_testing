@@ -530,7 +530,19 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 		skb_put(pkt1, out - skb_tail_pointer(pkt1));
 	}
 	else if (st == SLH_ST_LASTACK) {
-		/* silently drop everything in this state, we're draining ACKs */
+		/* We have already got the client's FIN. Silently drop
+		 * the empty ACKs in this state. However we may encounter
+		 * late retransmitted FINs, let's re-ACK them. All other
+		 * packets are reset.
+		 */
+		if (th->fin) {
+			/* return a FIN and go to the LASTACK state on FIN */
+			pkt1 = build_fin(dev, th->dest, th->source,
+					 ack, htonl(ntohl(th->seq) + datalen + 1));
+			goto send_ip;
+		}
+		if (datalen)
+			goto send_rst; /* forbidden to send data after FIN */
 		return;
 	}
 	else if (st == SLH_ST_ACK_CL_LAST) {
