@@ -207,9 +207,10 @@ static struct sk_buff *build_syn_ack(struct net_device *dev, u16 spt, u16 dpt, u
 }
 
 /* allocate an SKB for a data ACK with enough room for prepending ETH + IP in
- * front. The partial checksum is put into ->csum.
+ * front. The partial checksum is put into ->csum. skb->tail points to where
+ * the data can be copied.
  */
-static struct sk_buff *build_data_ack(struct net_device *dev, u16 spt, u16 dpt, u32 seq, u32 ack, u8 flags, u16 data)
+static struct sk_buff *build_data_ack(struct net_device *dev, u16 spt, u16 dpt, u32 seq, u32 ack, u32 flags, u32 data)
 {
 	struct sk_buff *out;
 
@@ -227,7 +228,7 @@ static struct sk_buff *build_data_ack(struct net_device *dev, u16 spt, u16 dpt, 
 	*(u32 *)(out->data + 12)  = htonl(0x501005b4); /* doff=20, ack, win=1460 */
 	*(u32 *)(out->data + 13)  |= flags;
 	*(u32 *)(out->data + 16)  = 0;                 /* check, urgptr */
-	skb_put(out, 20 + data);
+	skb_put(out, 20);
 
 	/* compute partial TCP checksum */
 	out->csum  = csum_partial(out->data, out->len, 0);
@@ -241,6 +242,8 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 	u32 ack, st;
 	u32 ihl;
 	u32 thlen;
+	u32 datalen;
+	const char *dataptr;
 	struct sk_buff *pkt1;
 
 	skb->protocol = eth_type_trans(skb, dev);
@@ -271,8 +274,14 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 		return;
 
 	/* retrieve the next state requested by the peer */
+	dataptr = (u8 *)th + thlen;
+	datalen = skb->data + skb->len - (u8 *)dataptr;
+
 	ack = th->ack_seq;
 	st = ntohl(ack) & 15;
+
+	//printk("syn=%d ack=%d fin=%d rst=%d st=%d\n",
+	//       th->syn, th->ack, th->fin, th->rst, st);
 
 	/* note that all sources and destinations are swapped since we're
 	 * responding to a peer.
@@ -282,21 +291,60 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 		pkt1 = build_syn_ack(dev, th->dest, th->source,
 		                     htonl((isn << 4) + SLH_ST_REQ - 1),  /* -1 for the SYN */
 		                     htonl(ntohl(th->seq) + 1));
-		if (!pkt1)
-			return;
 		isn++;
 	}
 	else if (th->rst) {
 		/* never reply anything to an RST */
 		return;
 	}
+	else if (!th->ack) {
+		/* we want an ACK here */
+		goto send_rst;
+	}
+	else if (st == SLH_ST_REQ) {
+		if (!datalen) {
+			if (th->fin) {
+				/* return a FIN and go to the LASTACK state on FIN */
+				pkt1 = build_fin(dev, th->dest, th->source,
+						 ack, htonl(ntohl(th->seq) + 1));
+				goto send_ip;
+			}
+			/* silently drop the connection ACK and the
+			 * keep-alive ACK on end of data transfer.
+			 */
+			return;
+		}
+		if (*(u32 *)dataptr != ntohl(0x47455420)) // "GET "
+			goto send_rst;
+		/* debug */
+
+		/* we offer a FIN if there was one, it allows us to increase the
+		 * SEQ by 1 and enter the next state.
+		 */
+		if (!th->fin)
+			pkt1 = build_data_ack(dev, th->dest, th->source,
+					      ack, htonl(ntohl(th->seq) + datalen),
+					      TCP_FLAG_PSH, 16);
+		else
+			pkt1 = build_data_ack(dev, th->dest, th->source,
+					      ack, htonl(ntohl(th->seq) + datalen + 1),
+					      TCP_FLAG_PSH | TCP_FLAG_FIN, 16);
+
+		memcpy(skb_tail_pointer(pkt1), "It Works Well!\r\n", 16);
+		skb_put(pkt1, 16);
+	}
+	else if (st == SLH_ST_LASTACK) {
+		/* silently drop everything in this state, we're draining ACKs */
+		return;
+	}
 	else {
 		/* for now on, we reset everything */
 		pkt1 = build_rst(dev, th->dest, th->source, ack);
-		if (!pkt1)
-			return;
 	}
 
+ send_ip:
+	if (!pkt1)
+		return;
 	insert_ip(pkt1, ih->id, ih->daddr, ih->saddr);
 	insert_eth(pkt1, skb);
 	update_tcp_csum(pkt1);
@@ -306,6 +354,11 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 	netif_receive_skb(pkt1);
 	local_bh_enable();
 	return;
+
+ send_rst:
+	/* for now on, we reset everything */
+	pkt1 = build_rst(dev, th->dest, th->source, ack);
+	goto send_ip;
 }
 
 static netdev_tx_t slhttp_xmit(struct sk_buff *skb, struct net_device *dev)
