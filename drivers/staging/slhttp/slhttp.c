@@ -343,6 +343,10 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 			return;
 		}
 
+		/* we need enough space for the response */
+		if (ntohs(th->window) < 1460)
+			return;
+
 		if (datalen < 15 || /* "GET / HTTP/1.0\n", at least supports telnet */
 		    *(u32 *)dataptr != ntohl(0x47455420) || dataptr[4] != '/') // "GET /"
 			goto send_rst;
