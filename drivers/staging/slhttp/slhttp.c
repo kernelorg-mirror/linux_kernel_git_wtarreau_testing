@@ -33,15 +33,27 @@ struct pcpu_dstats {
 };
 
 enum {
-	SLH_ST_REQ = 0,
-	SLH_ST_LASTACK = 1,
-
-	SLH_ST_ACK_CL_LAST = 2,
-	SLH_ST_ACK_CL_FIN = 3, /* must absolutely equal SLH_ST_ACK_CL_LAST + 1 */
-
+	SLH_ST_REQ           = 0,
+	SLH_ST_LASTACK       = 1,
+	/* data states for close mode: up to 8 packets may be sent (1 + 7 extra) */
+	SLH_ST_ACK_CL_LAST_7 = 2,
+	SLH_ST_ACK_CL_LAST_6 = 3,
+	SLH_ST_ACK_CL_LAST_5 = 4,
+	SLH_ST_ACK_CL_LAST_4 = 5,
+	SLH_ST_ACK_CL_LAST_3 = 6,
+	SLH_ST_ACK_CL_LAST_2 = 7,
+	SLH_ST_ACK_CL_LAST_1 = 8,
+	SLH_ST_ACK_CL_LAST   = 9,  /* last packetd ACKed, send FIN */
+	SLH_ST_ACK_CL_FIN    = 10, /* must absolutely equal SLH_ST_ACK_CL_LAST + 1 */
 	/* the last states must be the ones for the keep-alive mode, because we
-	 * want them to count +1 modulo 16 and automatically loop to 0.
+	 * want them to count +1 modulo 16 and automatically loop to 0, so up to
+	 * 6 packets may be sent (1 + 5 extra).
 	 */
+	SLH_ST_ACK_KA_LAST_5 = 11,
+	SLH_ST_ACK_KA_LAST_4 = 12,
+	SLH_ST_ACK_KA_LAST_3 = 13,
+	SLH_ST_ACK_KA_LAST_2 = 14,
+	SLH_ST_ACK_KA_LAST_1 = 15,
 };
 
 /* flags used to build our return packets */
@@ -302,7 +314,7 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 	ack = th->ack_seq;
 	st = ntohl(ack) & 15;
 
-	//printk("seq=%d ack_seq=%d syn=%d ack=%d fin=%d rst=%d st=%d\n",
+	//printk(KERN_ERR "seq=%d ack_seq=%d syn=%d ack=%d fin=%d rst=%d st=%d\n",
 	//       ntohl(th->seq), ntohl(th->ack_seq), th->syn,
 	//       th->ack, th->fin, th->rst, st);
 
@@ -438,6 +450,8 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 
 		pkt1_size = size;
 		if (pkt1_size > budget) {
+			int max_pkt;
+
 			/* need more than one packet. Each other packet will be
 			 * 1457 bytes (=1 modulo 16). The first one will carry
 			 * the complement.
@@ -445,14 +459,29 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 			 * This means that there are a number of sizes we cannot
 			 * handle, they're all those which add more than budget to
 			 * multiples of 1457. We don't care much, we simply truncate
-			 * the size so that the first packet can be sent.
+			 * the size so that the first packet can be sent and that we
+			 * don't send too many packets.
 			 */
+			if (ka || th->fin)
+				max_pkt = 5; /* 5 data states in the keep-alive chain */
+			else
+				max_pkt = 7; /* 7 data states in the close chain */
+
 			nb_data_pkt = size / 1457;
+
+			if (nb_data_pkt > max_pkt) {
+				nb_data_pkt = max_pkt;
+				size = nb_data_pkt * 1457 + budget;
+			}
+
 			pkt1_size = size - (nb_data_pkt * 1457);
 			if (pkt1_size > budget) {
 				pkt1_size = budget;
 				size = pkt1_size + nb_data_pkt * 1457;
 			}
+
+			//printk(KERN_ERR "@%d: Preparing to send %d bytes, with a first pkt of %d hdr + %d data (budget %d) and %d packets of 1457 (%d max). ka=%d ver=%d sizelen=%d\n", __LINE__,
+			//       size, hdrlen, pkt1_size, budget, nb_data_pkt, max_pkt, ka, ver, sizelen);
 		}
 
 		/* We don't consider our FIN here. It equals one byte but since
@@ -472,7 +501,7 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 		pad  = pad & 15;
 		/* pad is the size we need to add using the "X-Pad" header */
 
-		//printk("Preparing to send %d bytes, with a first pkt of %d hdr + %d pad + %d data (budget %d) and %d packets of 1457. ka=%d ver=%d finst=%d, sizelen=%d\n",
+		//printk(KERN_ERR "@%d: Preparing to send %d bytes, with a first pkt of %d hdr + %d pad + %d data (budget %d) and %d packets of 1457. ka=%d ver=%d finst=%d, sizelen=%d\n", __LINE__,
 		//       size, hdrlen, pad, pkt1_size, budget, nb_data_pkt, ka, ver, final_state, sizelen);
 
 		/* now it's getting tricky. We ack the peer's possible FIN only
@@ -529,6 +558,39 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 
 		skb_put(pkt1, out - skb_tail_pointer(pkt1));
 	}
+	else if ((st >= SLH_ST_ACK_CL_LAST_7 && st <= SLH_ST_ACK_CL_LAST_1) ||
+		 (st >= SLH_ST_ACK_KA_LAST_5 && st <= SLH_ST_ACK_KA_LAST_1)) {
+		int fin;
+
+		/* we need enough space for the response */
+		if (ntohs(th->window) < 1460)
+			return;
+
+		/* we want to send a FIN if we're sending the last packet in the
+		 * CLOSE mode, or if we're sending the last one in the keep-alive
+		 * mode and the client has already sent its FIN. It's also the
+		 * only case where we're ready to ACK the client's FIN.
+		 */
+		fin = (st == SLH_ST_ACK_KA_LAST_1 && th->fin) || (st == SLH_ST_ACK_CL_LAST_1);
+
+		pkt1 = build_data_ack(dev, th->dest, th->source,
+				      ack, htonl(ntohl(th->seq) + datalen + (fin && th->fin)),
+				      FLG_PSH + (fin ? FLG_FIN : 0),
+				      1460);
+		if (!pkt1)
+			return;
+
+		//printk(KERN_ERR "@%d: skb(%p)=%ld+%ld+%ld=%ld\n", __LINE__,
+		//       pkt1,
+		//       pkt1->data - pkt1->head,
+		//       skb_tail_pointer(pkt1) - pkt1->data,
+		//       skb_end_pointer(pkt1) - skb_tail_pointer(pkt1),
+		//       skb_end_pointer(pkt1) - pkt1->head);
+
+		//memset(skb_tail_pointer(pkt1), 0, 1460);
+		//skb_put(pkt1, 16); /* 16 bytes and loop here */
+		skb_put(pkt1, 1457); /* 91*16 + 1 => one step forward */
+	}
 	else if (st == SLH_ST_LASTACK) {
 		/* We have already got the client's FIN. Silently drop
 		 * the empty ACKs in this state. However we may encounter
@@ -563,7 +625,7 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 			return;
 
 		pkt1 = build_data_ack(dev, th->dest, th->source,
-				      ack, htonl(ntohl(th->seq) + th->fin),
+				      ack, htonl(ntohl(th->seq) + datalen + th->fin),
 				      0, 0);
 	}
 	else {
@@ -579,8 +641,8 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 	update_tcp_csum(pkt1);
 	pkt1->protocol = eth_type_trans(pkt1, dev);
 
-	*op = 1;
-	*ob = pkt1->len;
+	*op += 1;
+	*ob += pkt1->len;
 
 	netif_rx(pkt1);
 	// This does not work when ab uses 2 packets in keep-alive mode with
