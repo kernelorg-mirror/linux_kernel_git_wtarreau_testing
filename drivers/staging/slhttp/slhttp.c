@@ -231,6 +231,15 @@ static struct sk_buff *build_data_ack(struct net_device *dev, u16 spt, u16 dpt, 
 	if (!out)
 		return out;
 
+	//printk(KERN_ERR "@%d: skb(%p)=%ld+%ld+%ld=%ld (%d requested)\n",
+	//       __LINE__,
+	//       out,
+	//       out->data - out->head,
+	//       skb_tail_pointer(out) - out->data,
+	//       skb_end_pointer(out) - skb_tail_pointer(out),
+	//       skb_end_pointer(out) - out->head,
+	//       LEN_ETH + LEN_IP + 20 + data);
+
 	skb_reserve(out, LEN_ETH + LEN_IP);
 
 	/* build TCP header */
@@ -506,11 +515,12 @@ static void slhttp_reply_to_skb(struct net_device *dev, struct sk_buff *skb, int
 
 		/* fill with readable data for small packets, and skip one line for last char */
 		if (pkt1_size < 200) {
-			while (pkt1_size--) {
-				if (!pkt1_size)
+			int i;
+			for (i = 0; i < pkt1_size; i++) {
+				if (i == pkt1_size - 1)
 					*out++ = '\n';
 				else
-					*out++ = ".123456789ABCDEF"[pkt1_size & 15];
+					*out++ = ".123456789ABCDEF"[i & 15];
 			}
 		}
 		else {
